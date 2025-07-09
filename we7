@@ -1,0 +1,307 @@
+-- Kanistay Key Validator v3.1 (Token Input Kontrollü Sürüm)
+-- PowerShell mantığını eksiksiz uygulayan worker ile entegre
+
+local WORKER_URL = "https://kanistay.workers.dev"
+
+local validated = false
+local isBlacklisted = false
+local systemToken = "kanistay_token_2024" -- System.lua'daki token
+local workerToken = nil
+local tokenVerified = false
+local userTokenInput = nil
+
+-- Debug modu (true/false)
+local DEBUG_MODE = true
+
+local messages = {
+    blacklisted = "Bu HWID yasaklı.",
+    premium = "Premium kullanıcı hoş geldiniz!",
+    validated = "Key doğrulandı, sistem hazır.",
+    already_used = "Bu key başka bir cihaz tarafından kullanılıyor.",
+    invalid = "Geçersiz veya süresi dolmuş key.",
+    error = "Doğrulama sırasında hata oluştu.",
+    unknown = "Beklenmeyen bir hata oluştu.",
+    empty_key = "Lütfen doğrulamadan önce key girin.",
+    waiting = "Lütfen keyinizi girin.",
+    setup_complete = "Sistem hazır, key bekleniyor.",
+    token_mismatch = "Token doğrulaması başarısız.",
+    token_error = "Token alınamadı."
+}
+
+function SetValidatorMessage(status, msg)
+    messages[status] = msg
+end
+
+local function debugPrint(message, data)
+    if DEBUG_MODE then
+        print("[DEBUG] " .. message)
+        if data then
+            print("[DEBUG DATA] " .. tostring(data))
+        end
+    end
+end
+
+local function getHWID()
+    local hwid = ""
+    pcall(function()
+        hwid = game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    debugPrint("HWID obtained: " .. hwid)
+    return hwid
+end
+
+local function showNotification(title, message, duration)
+    local StarterGui = game:GetService("StarterGui")
+    StarterGui:SetCore("SendNotification", {
+        Title = title,
+        Text = message,
+        Duration = duration or 3
+    })
+end
+
+local function callWorker(action, hwid, key)
+    local HttpService = game:GetService("HttpService")
+    local requestData = {
+        action = action,
+        hwid = hwid,
+        key = key
+    }
+    
+    debugPrint("Sending request to worker:", WORKER_URL)
+    debugPrint("Action:", action)
+    debugPrint("Request data:", HttpService:JSONEncode(requestData))
+    
+    local success, response = pcall(function()
+        return request({
+            Url = WORKER_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(requestData)
+        })
+    end)
+    
+    if success then
+        debugPrint("Request successful, Status Code: " .. response.StatusCode)
+        debugPrint("Status Message: " .. response.StatusMessage)
+        debugPrint("Success: " .. tostring(response.Success))
+        debugPrint("Response Body: " .. response.Body)
+        
+        local isSuccess = response.Success or response.success or (response.StatusCode >= 200 and response.StatusCode < 300)
+        if isSuccess then
+            local responseData = HttpService:JSONDecode(response.Body)
+            debugPrint("Parsed response:", HttpService:JSONEncode(responseData))
+            return responseData
+        else
+            debugPrint("Request failed - Success: false")
+            debugPrint("Status Code: " .. response.StatusCode)
+            debugPrint("Status Message: " .. response.StatusMessage)
+            debugPrint("Response Body: " .. response.Body)
+            return { status = "error", message = "HTTP request failed: " .. response.StatusCode .. " - " .. response.StatusMessage }
+        end
+    else
+        debugPrint("PCall failed: " .. tostring(response))
+        warn("Worker request failed:", response and response.StatusCode or "Unknown error")
+        return { status = "error", message = "Network error: " .. tostring(response) }
+    end
+end
+
+local Validator = {}
+
+-- Token kontrolü - System.lua'dan gelen token'ı kontrol et
+function Validator.VerifyToken()
+    debugPrint("=== TOKEN VERIFICATION BAŞLADI ===")
+    
+    if not userTokenInput then
+        debugPrint("Kullanıcı token'ı girilmemiş")
+        showNotification("Token Hatası", "Lütfen token girin.", 5)
+        return false
+    end
+    
+    local result = callWorker("get_token", "", "")
+    
+    debugPrint("Token verification result status: " .. (result.status or "nil"))
+    debugPrint("Token verification result message: " .. (result.message or "nil"))
+    
+    if result.status == "validated" and result.token then
+        workerToken = result.token
+        debugPrint("Worker token alındı: " .. workerToken)
+        debugPrint("Kullanıcı token'ı: " .. userTokenInput)
+        
+        -- Token eşleşmesi kontrolü
+        if workerToken == userTokenInput then
+            tokenVerified = true
+            debugPrint("Token eşleşmesi başarılı")
+            return true
+        else
+            tokenVerified = false
+            debugPrint("Token eşleşmesi başarısız")
+            showNotification("Token Hatası", messages.token_mismatch, 5)
+            return false
+        end
+    else
+        tokenVerified = false
+        debugPrint("Token alınamadı")
+        showNotification("Token Hatası", messages.token_error, 5)
+        return false
+    end
+end
+
+-- Kullanıcı token'ını ayarla
+function Validator.SetUserToken(token)
+    userTokenInput = token
+    debugPrint("Kullanıcı token'ı ayarlandı: " .. token)
+end
+
+function Validator.Setup(onValidated)
+    debugPrint("=== SETUP STARTED ===")
+    
+    -- İlk önce token kontrolü yap
+    if not Validator.VerifyToken() then
+        debugPrint("Token doğrulaması başarısız, setup iptal edildi")
+        return false
+    end
+    
+    local hwid = getHWID()
+    local result = callWorker("validate", hwid, nil)
+    
+    debugPrint("Setup result status: " .. (result.status or "nil"))
+    debugPrint("Setup result message: " .. (result.message or "nil"))
+    
+    if result.status == "blacklisted" then
+        isBlacklisted = true
+        validated = false
+        debugPrint("User is blacklisted")
+        showNotification("Yasaklı", messages.blacklisted, 5)
+        return false
+    elseif result.status == "premium" then
+        validated = true
+        isBlacklisted = false
+        debugPrint("User is premium")
+        showNotification("Premium Erişim", messages.premium, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "waiting" then
+        validated = false
+        isBlacklisted = false
+        debugPrint("Setup complete, waiting for key")
+        showNotification("Sistem Hazır", messages.setup_complete, 3)
+        return true
+    else
+        validated = false
+        isBlacklisted = false
+        debugPrint("Setup completed with status: " .. (result.status or "nil"))
+        showNotification("Sistem Hazır", messages.setup_complete, 3)
+        return true
+    end
+end
+
+function Validator.ValidateKey(key, onValidated)
+    debugPrint("=== VALIDATE KEY STARTED ===")
+    debugPrint("Key to validate: " .. (key or "nil"))
+    
+    -- Token kontrolü yapılmamışsa hiçbir şey yapma
+    if not tokenVerified then
+        debugPrint("Token doğrulanmamış, validation iptal edildi")
+        showNotification("Token Hatası", messages.token_mismatch, 5)
+        return false
+    end
+    
+    if isBlacklisted then
+        debugPrint("User is blacklisted, blocking validation")
+        showNotification("Yasaklı", messages.blacklisted, 5)
+        return false
+    end
+    
+    if not key or key == "" then
+        debugPrint("Empty key provided")
+        showNotification("Boş Key", messages.empty_key, 3)
+        return false
+    end
+    
+    local hwid = getHWID()
+    local result = callWorker("validate", hwid, key)
+    
+    debugPrint("ValidateKey result status: " .. (result.status or "nil"))
+    debugPrint("ValidateKey result message: " .. (result.message or "nil"))
+    
+    if result.status == "blacklisted" then
+        isBlacklisted = true
+        validated = false
+        debugPrint("User became blacklisted during validation")
+        showNotification("Yasaklı", messages.blacklisted, 5)
+        return false
+    elseif result.status == "premium" then
+        validated = true
+        isBlacklisted = false
+        debugPrint("User validated as premium")
+        showNotification("Premium Erişim", messages.premium, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "already_used" then
+        validated = false
+        debugPrint("Key already used by another device")
+        showNotification("Key Kullanımda", messages.already_used, 4)
+        return false
+    elseif result.status == "invalid" then
+        validated = false
+        debugPrint("Key is invalid or expired")
+        showNotification("Geçersiz Key", messages.invalid, 4)
+        return false
+    elseif result.status == "validated" then
+        validated = true
+        isBlacklisted = false
+        debugPrint("Key validated successfully")
+        showNotification("Key Doğrulandı", messages.validated, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "error" then
+        validated = false
+        debugPrint("Error occurred during validation: " .. (result.message or "unknown"))
+        showNotification("Hata", messages.error, 4)
+        return false
+    else
+        validated = false
+        debugPrint("Unknown status received: " .. (result.status or "nil"))
+        showNotification("Bilinmeyen Hata", messages.unknown, 4)
+        return false
+    end
+end
+
+function Validator.IsValidated()
+    return validated and tokenVerified
+end
+
+function Validator.IsBlacklisted()
+    return isBlacklisted
+end
+
+function Validator.IsTokenVerified()
+    return tokenVerified
+end
+
+function Validator.SetMessage(status, msg)
+    SetValidatorMessage(status, msg)
+end
+
+function Validator.ResetValidation()
+    validated = false
+    isBlacklisted = false
+    tokenVerified = false
+    workerToken = nil
+    userTokenInput = nil
+    debugPrint("Validation reset")
+end
+
+-- Debug fonksiyonları
+function Validator.SetDebugMode(enabled)
+    DEBUG_MODE = enabled
+    debugPrint("Debug mode: " .. tostring(enabled))
+end
+
+function Validator.GetDebugMode()
+    return DEBUG_MODE
+end
+
+return Validator
