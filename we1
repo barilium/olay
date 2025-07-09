@@ -1,0 +1,148 @@
+-- Kanistay Key Validator v2.2 (Gelişmiş Mesaj ve Durum Yönetimi)
+
+local WORKER_URL = "https://kanistay.workers.dev"
+
+local validated = false
+local isBlacklisted = false
+
+local messages = {
+    blacklisted = "You are banned from using this system.",
+    premium = "Welcome back, premium user!",
+    validated = "System is ready for key validation.",
+    already_used = "This key is already used by another device.",
+    invalid = "Invalid or expired key.",
+    error = "An error occurred during validation.",
+    unknown = "An unexpected error occurred.",
+    empty_key = "Please enter a key before validating."
+}
+
+function SetValidatorMessage(status, msg)
+    messages[status] = msg
+end
+
+local function getHWID()
+    local hwid = ""
+    pcall(function()
+        hwid = game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    return hwid
+end
+
+local function showNotification(title, message, duration)
+    local StarterGui = game:GetService("StarterGui")
+    StarterGui:SetCore("SendNotification", {
+        Title = title,
+        Text = message,
+        Duration = duration or 3
+    })
+end
+
+local function callWorker(hwid, key)
+    local HttpService = game:GetService("HttpService")
+    local requestData = {
+        action = "validate",
+        hwid = hwid,
+        key = key
+    }
+    local success, response = pcall(function()
+        return HttpService:RequestAsync({
+            Url = WORKER_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(requestData)
+        })
+    end)
+    if success and response.Success then
+        local responseData = HttpService:JSONDecode(response.Body)
+        return responseData
+    else
+        warn("Worker request failed:", response and response.StatusCode or "Unknown error")
+        return { status = "error", message = messages.error }
+    end
+end
+
+local Validator = {}
+
+function Validator.Setup(onValidated)
+    local hwid = getHWID()
+    local result = callWorker(hwid, nil)
+    if result.status == "blacklisted" then
+        isBlacklisted = true
+        showNotification("Banned", messages.blacklisted, 5)
+        return true
+    elseif result.status == "premium" then
+        validated = true
+        showNotification("Premium Access", messages.premium, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "validated" then
+        validated = true
+        showNotification("Setup Complete", messages.validated, 3)
+        if onValidated then onValidated() end
+        return true
+    else
+        showNotification("Setup Complete", messages.validated, 3)
+        return true
+    end
+end
+
+function Validator.ValidateKey(key, onValidated)
+    if isBlacklisted then
+        showNotification("Banned", messages.blacklisted, 5)
+        return true
+    end
+    if not key or key == "" then
+        showNotification("Empty Key", messages.empty_key, 3)
+        return true
+    end
+    local hwid = getHWID()
+    local result = callWorker(hwid, key)
+    if result.status == "blacklisted" then
+        isBlacklisted = true
+        showNotification("Banned", messages.blacklisted, 5)
+        return true
+    elseif result.status == "premium" then
+        validated = true
+        showNotification("Premium Access", messages.premium, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "already_used" then
+        showNotification("Key Already Used", messages.already_used, 4)
+        return true
+    elseif result.status == "invalid" then
+        showNotification("Invalid Key", messages.invalid, 4)
+        return true
+    elseif result.status == "validated" then
+        validated = true
+        showNotification("Key Validated", messages.validated, 3)
+        if onValidated then onValidated() end
+        return true
+    elseif result.status == "error" then
+        showNotification("Error", messages.error, 4)
+        return true
+    else
+        showNotification("Unknown Error", messages.unknown, 4)
+        return true
+    end
+end
+
+function Validator.IsValidated()
+    return validated
+end
+
+function Validator.IsBlacklisted()
+    return isBlacklisted
+end
+
+function Validator.SetMessage(status, msg)
+    SetValidatorMessage(status, msg)
+end
+
+function Validator.ResetValidation()
+    validated = false
+    isBlacklisted = false
+end
+
+return Validator
