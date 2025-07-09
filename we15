@@ -1,0 +1,279 @@
+-- KeyGuardian Validator
+-- Bu dosya Roblox'ta çalışır ve KeyGuardian Brain System ile iletişim kurar
+
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Validator = {}
+
+-- Gerçek HWID
+local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
+
+-- Configuration
+local BRAIN_URL = "https://jovial-snickerdoodle-3c151c.netlify.app" -- Brain system URL'ini buraya koy
+local SYSTEM_TOKEN = nil -- Bu token system.lua'dan gelecek
+
+-- Core Functions
+-- getHWIDFromHeaders fonksiyonu kaldırıldı
+
+local function makeRequest(endpoint, data, method)
+    method = method or "POST"
+    local url = BRAIN_URL .. endpoint
+
+    local requestOptions = {
+        Url = url,
+        Method = method,
+        Headers = {
+            ["Content-Type"] = "application/json"
+        }
+    }
+
+    if data and method ~= "GET" then
+        requestOptions.Body = HttpService:JSONEncode(data)
+    end
+
+    print("➡️ [makeRequest] URL:", url)
+    print("➡️ [makeRequest] Method:", method)
+    print("➡️ [makeRequest] Body:", requestOptions.Body or "YOK")
+
+    local success, response = pcall(function()
+        return request(requestOptions)
+    end)
+
+    print("⬅️ [makeRequest] Success:", success)
+    if response then
+        print("⬅️ [makeRequest] StatusCode:", response.StatusCode)
+        print("⬅️ [makeRequest] StatusMessage:", response.StatusMessage)
+        print("⬅️ [makeRequest] Response.Body:", response.Body)
+    else
+        print("⬅️ [makeRequest] Response: YOK")
+    end
+
+    -- BAŞARI KONTROLÜ ARTIK StatusCode İLE
+    if success and response and response.StatusCode == 200 then
+        local decoded = HttpService:JSONDecode(response.Body)
+        return decoded, response.Headers
+    else
+        warn("🚨 Brain connection failed: " .. tostring(response and response.StatusMessage or "Unknown error"))
+        warn("🚨 Brain connection failed BODY: " .. tostring(response and response.Body or "YOK"))
+        return {
+            success = false,
+            message = "Connection failed: " .. tostring(response and response.StatusMessage or "Unknown error")
+        }, {}
+    end
+end
+
+local function sendCoreMessage(message, messageType)
+    messageType = messageType or "info"
+    
+    local colors = {
+        success = "✅",
+        error = "❌", 
+        warning = "⚠️",
+        info = "ℹ️"
+    }
+    
+    local prefix = colors[messageType] or "ℹ️"
+    print(prefix .. " KeyGuardian: " .. message)
+    
+    -- Eğer System.lua ile connection varsa, mesajı gönder
+    if _G.SystemReceiveMessage then
+        _G.SystemReceiveMessage(message, messageType)
+    end
+end
+
+-- Token Setup Fonksiyonu
+function Validator.Setup(systemToken, loaderFunction)
+    if not systemToken then
+        sendCoreMessage("No token provided", "error")
+        return false
+    end
+    
+    sendCoreMessage("Validating system token...", "info")
+    
+    -- Token'ı brain'e gönder ve doğrula
+    local tokenResponse, headers = makeRequest("/validate-token", {
+        token = systemToken
+    })
+    
+    if tokenResponse.success then
+        SYSTEM_TOKEN = systemToken
+        _G.KeyGuardianLoaderFunction = loaderFunction
+        sendCoreMessage("Token validated successfully", "success")
+        return true
+    else
+        sendCoreMessage("Invalid token: " .. tokenResponse.message, "error")
+        return false
+    end
+end
+
+-- Ana Validation Fonksiyonu
+function Validator.StartValidation()
+    if not SYSTEM_TOKEN then
+        sendCoreMessage("Token not set. Call Setup first.", "error")
+        return false
+    end
+    
+    local hwidResponse, responseHeaders = makeRequest("/validate-hwid", {
+        hwid = HWID,
+        token = SYSTEM_TOKEN
+    })
+    
+    if not hwidResponse.success then
+        if hwidResponse.status == "banned" then
+            sendCoreMessage("User banned", "error")
+            Validator.BlockUser()
+            return false
+        else
+            sendCoreMessage("Validation failed: " .. hwidResponse.message, "error")
+            return false
+        end
+    end
+    
+    -- 3. Response'a göre aksiyon al
+    if hwidResponse.status == "validated" then
+        -- Premium user, direkt validate et
+        sendCoreMessage("Premium user validated!", "success")
+        Validator.ValidateUser(HWID or "UNKNOWN", hwidResponse.data.key, "premium")
+        return true
+        
+    elseif hwidResponse.status == "waiting_key" then
+        Validator.WaitForKey(HWID or "UNKNOWN")
+        return true
+        
+    else
+        sendCoreMessage("Unknown response status: " .. hwidResponse.status, "error")
+        return false
+    end
+end
+
+function Validator.WaitForKey(hwid)
+    
+    -- Global function key girişi için
+    _G.ValidatorReceiveKey = function(key)
+        if not key or key == "" then
+            sendCoreMessage("Empty key provided", "error")
+            return
+        end
+        
+        sendCoreMessage("Validating key: " .. key, "info")
+        
+        -- Key'i brain'e gönder (HWID gerçek şekilde gönderilecek)
+        local keyResponse, responseHeaders = makeRequest("/validate-key", {
+            hwid = HWID,
+            key = key,
+            token = SYSTEM_TOKEN
+        })
+        
+        -- HWID'yi doğrudan kullan
+        local realHWID = HWID
+        
+        if keyResponse.success then
+            if keyResponse.status == "validated" then
+                sendCoreMessage("Key validated successfully!", "success")
+                Validator.ValidateUser(realHWID, key, keyResponse.data.type)
+            else
+                sendCoreMessage("Key validation failed: " .. keyResponse.message, "error")
+            end
+        else
+            if keyResponse.status == "banned" then
+                sendCoreMessage("User banned", "error")
+                Validator.BlockUser()
+            elseif keyResponse.status == "key_already_used" then
+                sendCoreMessage("Key already used", "error")
+            elseif keyResponse.status == "key_invalid" then
+                sendCoreMessage("Key expired or invalid", "error")
+            else
+                sendCoreMessage("Key validation failed: " .. keyResponse.message, "error")
+            end
+        end
+    end
+    
+    -- Key input UI'sini göster (System.lua'ya sinyal gönder)
+    if _G.SystemShowKeyInput then
+        _G.SystemShowKeyInput()
+    end
+end
+
+function Validator.ValidateKey(systemToken, key, loaderFunction)
+    if not SYSTEM_TOKEN or SYSTEM_TOKEN ~= systemToken then
+        sendCoreMessage("Invalid system token", "error")
+        return
+    end
+    
+    if _G.ValidatorReceiveKey then
+        _G.ValidatorReceiveKey(key)
+    else
+        sendCoreMessage("Validator not ready for key input", "error")
+    end
+end
+
+function Validator.ValidateUser(hwid, key, keyType)
+    sendCoreMessage("User validated with " .. keyType .. " key", "success")
+    
+    -- Global validation state'i set et
+    _G.KeyGuardianValidated = true
+    _G.KeyGuardianHWID = hwid
+    _G.KeyGuardianKey = key
+    _G.KeyGuardianKeyType = keyType
+    
+    -- Loader'ı çalıştır
+    if _G.KeyGuardianLoaderFunction then
+        _G.KeyGuardianLoaderFunction()
+    end
+    
+    -- System.lua'ya validation signal'i gönder
+    if _G.SystemUserValidated then
+        _G.SystemUserValidated(hwid, key, keyType)
+    end
+end
+
+function Validator.BlockUser()
+    sendCoreMessage("User blocked - disconnecting", "error")
+    
+    -- Global block state'i set et
+    _G.KeyGuardianBlocked = true
+    
+    -- System.lua connection'ını kes
+    _G.SystemReceiveMessage = nil
+    _G.SystemUserValidated = nil
+    _G.SystemShowKeyInput = nil
+    _G.ValidatorReceiveKey = nil
+    
+    -- Kullanıcıyı oyundan at
+    local player = Players.LocalPlayer
+    if player then
+        player:Kick("KeyGuardian: User banned")
+    end
+end
+
+-- Validation durumunu kontrol et
+function Validator.IsValidated()
+    return _G.KeyGuardianValidated == true
+end
+
+function Validator.IsBlocked()
+    return _G.KeyGuardianBlocked == true
+end
+
+-- Test fonksiyonu
+function Validator.TestConnection()
+    local response, headers = makeRequest("/health", {}, "GET")
+    if response.success then
+        sendCoreMessage("Brain connection successful", "success")
+        local hwid = HWID
+        if hwid then
+            sendCoreMessage("Auto-detected HWID: " .. hwid, "info")
+        end
+        return true
+    else
+        sendCoreMessage("Brain connection failed", "error")
+        return false
+    end
+end
+
+-- Global access
+_G.KeyGuardianValidator = Validator
+
+return Validator
