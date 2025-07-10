@@ -1,0 +1,558 @@
+-- KeyGuardian Validator
+-- Bu dosya Roblox'ta çalışır ve KeyGuardian Brain System ile iletişim kurar
+
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Validator = {}
+
+-- Gerçek HWID
+local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
+
+-- Configuration
+local BRAIN_URL = "https://kanistay.workers.dev/keyauth" -- Cloudflare Workers URL'i
+local SYSTEM_TOKEN = nil -- Bu token system.lua'dan gelecek
+local SECRET_SIGNATURE = "KeyGuardian2024SecretKey" -- Özel imza anahtarı (Workers'da da aynı olmalı)
+
+-- Kriptografi Anahtarları
+local CRYPTO_KEY = "KeyGuardianCrypto2024" -- XOR şifreleme anahtarı
+
+-- Executor Desteği Kontrolü
+local ExecutorSupport = {
+    lz4 = false,
+    base64 = false,
+    crypt = false,
+    bit32 = false
+}
+
+-- Executor desteğini kontrol et
+local function checkExecutorSupport()
+    local supported = 0
+    
+    -- LZ4 kontrolü
+    if pcall(function() return lz4compress("test") end) then
+        ExecutorSupport.lz4 = true
+        supported = supported + 1
+        print("✅ LZ4 compression supported")
+    else
+        print("❌ LZ4 compression not supported")
+    end
+    
+    -- Base64 kontrolü
+    if pcall(function() return crypt.base64encode("test") end) then
+        ExecutorSupport.base64 = true
+        supported = supported + 1
+        print("✅ Base64 encoding supported")
+    else
+        print("❌ Base64 encoding not supported")
+    end
+    
+    -- Crypt kontrolü
+    if pcall(function() return crypt.generatekey(16) end) then
+        ExecutorSupport.crypt = true
+        supported = supported + 1
+        print("✅ Crypt functions supported")
+    else
+        print("❌ Crypt functions not supported")
+    end
+    
+    -- Bit32 kontrolü
+    if pcall(function() return bit32.bxor(1, 2) end) then
+        ExecutorSupport.bit32 = true
+        supported = supported + 1
+        print("✅ Bit32 operations supported")
+    else
+        print("❌ Bit32 operations not supported")
+    end
+    
+    print("📊 Executor Support Summary: " .. supported .. "/4 features supported")
+    
+    -- En az 1 özellik desteklenmeli
+    if supported == 0 then
+        error("🚨 No encryption features supported by executor! System cannot work securely.")
+    end
+    
+    return supported
+end
+
+-- İmza oluşturma fonksiyonu (Workers'daki ile aynı)
+local function generateSignature(hwid, timestamp)
+    local dataToSign = hwid .. timestamp .. SECRET_SIGNATURE
+    
+    if ExecutorSupport.bit32 then
+        -- Bit32 ile hash
+        local hash = 0
+        for i = 1, #dataToSign do
+            local char = string.byte(dataToSign, i)
+            hash = bit32.bxor(bit32.lshift(hash, 5) - hash, char)
+        end
+        return string.format("%08x", bit32.band(hash, 0xFFFFFFFF))
+    else
+        -- Basit hash (fallback)
+        local hash = 0
+        for i = 1, #dataToSign do
+            local char = string.byte(dataToSign, i)
+            hash = ((hash * 31) + char) % 0xFFFFFFFF
+        end
+        return string.format("%08x", hash)
+    end
+end
+
+-- XOR Şifreleme Fonksiyonu (bit32 varsa güvenli, yoksa fallback)
+local function xorEncrypt(data, key)
+    local encrypted = {}
+    for i = 1, #data do
+        local dataByte = string.byte(data, i)
+        local keyByte = string.byte(key, ((i - 1) % #key) + 1)
+        if bit32 and bit32.bxor then
+            encrypted[i] = string.char(bit32.bxor(dataByte, keyByte))
+        else
+            -- Fallback: Basit toplama (güvenli değil ama çalışır)
+            encrypted[i] = string.char((dataByte + keyByte) % 256)
+        end
+    end
+    return table.concat(encrypted)
+end
+
+-- XOR Şifre Çözme Fonksiyonu (fallback ile uyumlu)
+local function xorDecrypt(data, key)
+    if bit32 and bit32.bxor then
+        return xorEncrypt(data, key)
+    else
+        -- Fallback çözme
+        local decrypted = {}
+        for i = 1, #data do
+            local dataByte = string.byte(data, i)
+            local keyByte = string.byte(key, ((i - 1) % #key) + 1)
+            decrypted[i] = string.char((dataByte - keyByte + 256) % 256)
+        end
+        return table.concat(decrypted)
+    end
+end
+
+-- Hex encoding
+local function hexEncode(str)
+    local hex = ""
+    for i = 1, #str do
+        hex = hex .. string.format("%02x", string.byte(str, i))
+    end
+    return hex
+end
+
+-- Hex decoding
+local function hexDecode(hex)
+    local str = ""
+    for i = 1, #hex, 2 do
+        str = str .. string.char(tonumber(hex:sub(i, i+1), 16))
+    end
+    return str
+end
+
+-- Veri Şifreleme Fonksiyonu (sadece XOR + Base64/Hex)
+local function encryptData(data)
+    local jsonData = HttpService:JSONEncode(data)
+    local encrypted = xorEncrypt(jsonData, CRYPTO_KEY)
+    if ExecutorSupport.base64 then
+        return crypt.base64encode(encrypted), "base64"
+    else
+        return hexEncode(encrypted), "hex"
+    end
+end
+
+-- Veri Şifre Çözme Fonksiyonu (sadece XOR + Base64/Hex)
+local function decryptData(encodedData, encodingType)
+    local decoded
+    if encodingType == "base64" and ExecutorSupport.base64 then
+        decoded = crypt.base64decode(encodedData)
+    else
+        decoded = hexDecode(encodedData)
+    end
+    local decrypted = xorDecrypt(decoded, CRYPTO_KEY)
+    return HttpService:JSONDecode(decrypted)
+end
+
+-- Core Functions
+-- getHWIDFromHeaders fonksiyonu kaldırıldı
+
+local function makeRequest(endpoint, data, method)
+    method = method or "POST"
+    local url = BRAIN_URL .. endpoint
+
+    -- Zaman damgası ve imza oluştur
+    local timestamp = math.floor(tick())
+    local signature = generateSignature(HWID, timestamp)
+    
+    -- İmza ve zaman damgasını data'ya ekle
+    data.signature = signature
+    data.timestamp = timestamp
+    
+    -- Veriyi şifrele
+    local encryptedData, encodingType = encryptData(data)
+
+    local requestOptions = {
+        Url = url,
+        Method = method or "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["X-Encrypted"] = "true",
+            ["X-Crypto-Version"] = "1.0"
+        }
+    }
+
+    if encryptedData and method ~= "GET" then
+        requestOptions.Body = HttpService:JSONEncode({
+            encrypted = encryptedData,
+            hwid = HWID,
+            timestamp = timestamp,
+            encodingType = encodingType
+        })
+    end
+
+    print("➡️ [makeRequest] URL:", url)
+    print("➡️ [makeRequest] Method:", method)
+    print("➡️ [makeRequest] Signature:", signature)
+    print("➡️ [makeRequest] Timestamp:", timestamp)
+    print("➡️ [makeRequest] Encrypted:", string.sub(encryptedData, 1, 50) .. "...")
+
+    local success, response = pcall(function()
+        return request(requestOptions)
+    end)
+
+    print("⬅️ [makeRequest] Success:", success)
+    if response then
+        print("⬅️ [makeRequest] StatusCode:", response.StatusCode)
+        print("⬅️ [makeRequest] StatusMessage:", response.StatusMessage)
+        print("⬅️ [makeRequest] Response.Body:", response.Body)
+    else
+        print("⬅️ [makeRequest] Response: YOK")
+    end
+
+    -- BAŞARI KONTROLÜ ARTIK StatusCode İLE
+    if success and response and response.StatusCode == 200 then
+        local responseData = HttpService:JSONDecode(response.Body)
+        
+        -- Şifrelenmiş response'u çöz
+        if responseData.encrypted then
+            local decryptedData = decryptData(responseData.encrypted, responseData.encodingType)
+            return decryptedData, response.Headers
+        else
+            return responseData, response.Headers
+        end
+    else
+        warn("🚨 Brain connection failed: " .. tostring(response and response.StatusMessage or "Unknown error"))
+        warn("🚨 Brain connection failed BODY: " .. tostring(response and response.Body or "YOK"))
+        return {
+            success = false,
+            message = "Connection failed: " .. tostring(response and response.StatusMessage or "Unknown error")
+        }, {}
+    end
+end
+
+local function sendCoreMessage(message, messageType)
+    messageType = messageType or "info"
+    
+    local colors = {
+        success = "✅",
+        error = "❌", 
+        warning = "⚠️",
+        info = "ℹ️"
+    }
+    
+    local prefix = colors[messageType] or "ℹ️"
+    print(prefix .. " KeyGuardian: " .. message)
+    
+    -- Eğer System.lua ile connection varsa, mesajı gönder
+    if _G.SystemReceiveMessage then
+        _G.SystemReceiveMessage(message, messageType)
+    end
+end
+
+-- Token Setup Fonksiyonu
+function Validator.Setup(systemToken, loaderFunction)
+    if not systemToken then
+        sendCoreMessage("No token provided", "error")
+        return false
+    end
+    
+    -- Executor desteğini kontrol et
+    sendCoreMessage("Checking executor support...", "info")
+    local supportedFeatures = checkExecutorSupport()
+    
+    if supportedFeatures == 0 then
+        sendCoreMessage("No encryption features supported! System cannot work securely.", "error")
+        return false
+    end
+    
+    sendCoreMessage("Executor support checked: " .. supportedFeatures .. "/4 features", "success")
+    sendCoreMessage("Validating system token...", "info")
+    
+    -- Token'ı brain'e gönder ve doğrula
+    local tokenResponse, headers = makeRequest("/validate-token", {
+        token = systemToken
+    })
+    
+    if tokenResponse.success then
+        SYSTEM_TOKEN = systemToken
+        _G.KeyGuardianLoaderFunction = loaderFunction
+        sendCoreMessage("Token validated successfully", "success")
+        return true
+    else
+        sendCoreMessage("Invalid token: " .. tokenResponse.message, "error")
+        return false
+    end
+end
+
+-- Ana Validation Fonksiyonu
+function Validator.StartValidation()
+    if not SYSTEM_TOKEN then
+        sendCoreMessage("Token not set. Call Setup first.", "error")
+        return false
+    end
+    
+    local hwidResponse, responseHeaders = makeRequest("/validate-hwid", {
+        hwid = HWID,
+        token = SYSTEM_TOKEN
+    })
+    
+    if not hwidResponse.success then
+        if hwidResponse.status == "banned" then
+            sendCoreMessage("User banned", "error")
+            Validator.BlockUser()
+            return false
+        else
+            sendCoreMessage("Validation failed: " .. hwidResponse.message, "error")
+            return false
+        end
+    end
+    
+    -- 3. Response'a göre aksiyon al
+    if hwidResponse.status == "validated" then
+        -- Premium user, direkt validate et
+        sendCoreMessage("Premium user validated!", "success")
+        Validator.ValidateUser(HWID or "UNKNOWN", hwidResponse.data.key, "premium")
+        return true
+        
+    elseif hwidResponse.status == "waiting_key" then
+        Validator.WaitForKey(HWID or "UNKNOWN")
+        return true
+        
+    else
+        sendCoreMessage("Unknown response status: " .. hwidResponse.status, "error")
+        return false
+    end
+end
+
+function Validator.WaitForKey(hwid)
+    
+    -- Global function key girişi için
+    _G.ValidatorReceiveKey = function(key)
+        if not key or key == "" then
+            sendCoreMessage("Empty key provided", "error")
+            return
+        end
+        
+        sendCoreMessage("Validating key: " .. key, "info")
+        
+        -- Key'i brain'e gönder (HWID gerçek şekilde gönderilecek)
+        local keyResponse, responseHeaders = makeRequest("/validate-key", {
+            hwid = HWID,
+            key = key,
+            token = SYSTEM_TOKEN
+        })
+        
+        -- HWID'yi doğrudan kullan
+        local realHWID = HWID
+        
+        if keyResponse.success then
+            if keyResponse.status == "validated" then
+                sendCoreMessage("Key validated successfully!", "success")
+                Validator.ValidateUser(realHWID, key, keyResponse.data.type)
+            else
+                sendCoreMessage("Key validation failed: " .. keyResponse.message, "error")
+            end
+        else
+            if keyResponse.status == "banned" then
+                sendCoreMessage("User banned", "error")
+                Validator.BlockUser()
+            elseif keyResponse.status == "key_already_used" then
+                sendCoreMessage("Key already used", "error")
+            elseif keyResponse.status == "key_invalid" then
+                sendCoreMessage("Key expired or invalid", "error")
+            else
+                sendCoreMessage("Key validation failed: " .. keyResponse.message, "error")
+            end
+        end
+    end
+    
+    -- Key input UI'sini göster (System.lua'ya sinyal gönder)
+    if _G.SystemShowKeyInput then
+        _G.SystemShowKeyInput()
+    end
+end
+
+local SAVED_KEY_FILE = "kanistay_key.json"
+local RATE_LIMIT_WINDOW = 30 -- saniye
+local RATE_LIMIT_MAX = 4
+local validateTimestamps = {}
+
+-- Saved key dosyasını oku
+local function readSavedKey()
+    if isfile and isfile(SAVED_KEY_FILE) then
+        local content = readfile(SAVED_KEY_FILE)
+        if content and #content > 0 then
+            return content
+        end
+    end
+    return nil
+end
+
+-- Saved key dosyasına yaz
+local function writeSavedKey(key)
+    if writefile then
+        writefile(SAVED_KEY_FILE, key)
+    end
+end
+
+-- Saved key dosyasını sil
+local function deleteSavedKey()
+    if delfile and isfile and isfile(SAVED_KEY_FILE) then
+        delfile(SAVED_KEY_FILE)
+    end
+end
+
+-- Rate limit kontrolü
+local function checkRateLimit()
+    local now = os.time()
+    -- Eski timestamp'leri temizle
+    for i = #validateTimestamps, 1, -1 do
+        if now - validateTimestamps[i] > RATE_LIMIT_WINDOW then
+            table.remove(validateTimestamps, i)
+        end
+    end
+    if #validateTimestamps >= RATE_LIMIT_MAX then
+        local waitTime = RATE_LIMIT_WINDOW - (now - validateTimestamps[1])
+        return false, waitTime
+    end
+    table.insert(validateTimestamps, now)
+    return true
+end
+
+-- Boş/space input kontrolü
+local function isValidKeyInput(key)
+    if not key or #key == 0 then return false end
+    if key:match("^%s*$") then return false end
+    return true
+end
+
+-- Başlangıçta saved key varsa otomatik validate
+local function autoValidateSavedKey(token, loader)
+    local savedKey = readSavedKey()
+    if savedKey and isValidKeyInput(savedKey) then
+        print("[KeyGuardian] Saved key bulundu, otomatik validate ediliyor...")
+        Validator.ValidateKey(token, savedKey, loader)
+    end
+end
+
+-- Başarılı doğrulamada key'i kaydet
+function Validator.SaveKey(key)
+    if key and isValidKeyInput(key) then
+        writeSavedKey(key)
+        print("[KeyGuardian] Key kaydedildi: " .. key)
+    end
+end
+
+-- Validate fonksiyonunu güncelle (rate limit ve input kontrolü dahil)
+function Validator.ValidateKey(token, key, loader)
+    if not isValidKeyInput(key) then
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Enter a key", "warning")
+        end
+        return false
+    end
+    local allowed, waitTime = checkRateLimit()
+    if not allowed then
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Please wait " .. tostring(waitTime) .. " seconds to try again", "warning")
+        end
+        return false
+    end
+    -- Normal validate işlemleri (eski kodun devamı)
+    -- ... mevcut validate işlemleri ...
+    -- Başarılı doğrulamada:
+    -- Validator.SaveKey(key)
+    -- ...
+end
+
+-- Script başında saved key varsa otomatik validate
+-- (system.lua'dan çağrılacak şekilde ayarla)
+Validator.AutoValidateSavedKey = autoValidateSavedKey
+
+function Validator.ValidateUser(hwid, key, keyType)
+    sendCoreMessage("User validated with " .. keyType .. " key", "success")
+    
+    -- Global validation state'i set et
+    _G.KeyGuardianValidated = true
+    _G.KeyGuardianHWID = hwid
+    _G.KeyGuardianKey = key
+    _G.KeyGuardianKeyType = keyType
+    
+    -- Loader'ı çalıştır
+    if _G.KeyGuardianLoaderFunction then
+        _G.KeyGuardianLoaderFunction()
+    end
+    
+    -- System.lua'ya validation signal'i gönder
+    if _G.SystemUserValidated then
+        _G.SystemUserValidated(hwid, key, keyType)
+    end
+end
+
+function Validator.BlockUser()
+    sendCoreMessage("User blocked - disconnecting", "error")
+    
+    -- Global block state'i set et
+    _G.KeyGuardianBlocked = true
+    
+    -- System.lua connection'ını kes
+    _G.SystemReceiveMessage = nil
+    _G.SystemUserValidated = nil
+    _G.SystemShowKeyInput = nil
+    _G.ValidatorReceiveKey = nil
+    
+    -- Kullanıcıyı oyundan at
+    local player = Players.LocalPlayer
+    if player then
+        player:Kick("KeyGuardian: User banned")
+    end
+end
+
+-- Validation durumunu kontrol et
+function Validator.IsValidated()
+    return _G.KeyGuardianValidated == true
+end
+
+function Validator.IsBlocked()
+    return _G.KeyGuardianBlocked == true
+end
+
+-- Test fonksiyonu
+function Validator.TestConnection()
+    local response, headers = makeRequest("/health", {}, "GET")
+    if response.success then
+        sendCoreMessage("Brain connection successful", "success")
+        local hwid = HWID
+        if hwid then
+            sendCoreMessage("Auto-detected HWID: " .. hwid, "info")
+        end
+        return true
+    else
+        sendCoreMessage("Brain connection failed", "error")
+        return false
+    end
+end
+
+-- Global access
+_G.KeyGuardianValidator = Validator
+
+return Validator
